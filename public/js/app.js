@@ -1,6 +1,7 @@
 import { api } from './api.js';
 import { esc, toast } from './ui.js';
 import { mountWorkspace } from './workspace.js';
+import { openImportPackage } from './package-transfer.js';
 
 async function renderHome() {
   const view = document.getElementById('view');
@@ -18,6 +19,7 @@ async function renderHome() {
           <input type="number" id="np-tol" min="0.01" step="0.1" value="2" />
         </label>
         <button id="np-create">新建方案</button>
+        <button class="secondary" id="np-import" style="margin-left:auto">📦 导入方案包（.zip）</button>
       </div>
 
       <table class="list">
@@ -44,6 +46,13 @@ async function renderHome() {
     if (!(tol > 0)) return toast('容差必须是正数（毫米）', 'error');
     const state = await api.createProject(name, tol);
     location.hash = `#/project/${state.project.id}`;
+  };
+  document.getElementById('np-import').onclick = () => {
+    openImportPackage({
+      onImported: (state) => {
+        location.hash = `#/project/${state.project.id}`;
+      },
+    });
   };
 }
 

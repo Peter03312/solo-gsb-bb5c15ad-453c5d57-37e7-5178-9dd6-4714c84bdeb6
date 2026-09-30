@@ -60,4 +60,12 @@ export const api = {
       version,
       body: { candidates, base_version: baseVersion, batch_fingerprint: fingerprint },
     }).then((r) => r.data),
+  // 方案移交包：下载为浏览器直连 GET（Blob 另存）；导入为 multipart 上传。
+  exportUrl: (pid) => `/api/projects/${pid}/export`,
+  importPackage: (file, name) => {
+    const fd = new FormData();
+    fd.append('package', file);
+    if (name) fd.append('name', name);
+    return request('POST', '/api/imports', { body: fd }).then((r) => r.data);
+  },
 };

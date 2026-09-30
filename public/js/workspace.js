@@ -22,6 +22,7 @@ export async function mountWorkspace(projectId) {
         <div class="footer">
           <button id="btn-new-seam">新建接缝</button>
           <button id="btn-batch">批量试拼</button>
+          <button class="secondary" id="btn-export">📦 下载方案包（移交另一台工作台）</button>
         </div>
       </aside>
 
@@ -560,6 +561,19 @@ export async function mountWorkspace(projectId) {
       },
       onError: handleWriteError,
     });
+  };
+
+  // ---------- 下载自包含方案包（GET 直连，包内为当前版本快照）----------
+  document.getElementById('btn-export').onclick = () => {
+    // 用隐藏链接触发浏览器另存；包内数据由服务器在同一版本快照中生成，
+    // 导出期间即便他人继续编辑，下载到的仍是同一版本的完整内容。
+    const a = document.createElement('a');
+    a.href = api.exportUrl(state.project.id);
+    a.download = '';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    toast('正在导出方案包（含照片、比例尺、接缝与闭合环摘要）', 'success');
   };
 
   function chooseSeamEnds() {

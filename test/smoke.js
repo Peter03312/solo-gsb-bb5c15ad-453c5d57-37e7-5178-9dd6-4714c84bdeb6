@@ -7,6 +7,9 @@ const fs = require('fs');
 const os = require('os');
 const http = require('http');
 
+const zipLib = require('../src/zip');
+const pkgIO = require('../src/packageio');
+
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'sherd-smoke-'));
 process.env.DB_FILE = path.join(process.env.DATA_DIR, 't.db');
 process.env.UPLOAD_DIR = path.join(process.env.DATA_DIR, 'uploads');
@@ -60,6 +63,82 @@ function multipart(fields, fileBuf) {
     },
     payload,
   };
+}
+
+// 下载二进制（ZIP）响应。
+function reqBuf(method, url, { body, version, raw } = {}) {
+  return new Promise((resolve, reject) => {
+    const headers = {};
+    let payload;
+    if (raw) {
+      payload = raw;
+      Object.assign(headers, body.getHeaders());
+    } else if (body !== undefined) {
+      payload = JSON.stringify(body);
+      headers['Content-Type'] = 'application/json';
+    }
+    if (version !== undefined) headers['Base-Version'] = String(version);
+    const r = http.request({ host: '127.0.0.1', port: process.env.PORT, path: url, method, headers }, (res) => {
+      const chunks = [];
+      res.on('data', (d) => chunks.push(d));
+      res.on('end', () => {
+        const buf = Buffer.concat(chunks);
+        let json = null;
+        try { json = JSON.parse(buf.toString('utf8')); } catch {}
+        resolve({ status: res.statusCode, json, buf, headers: res.headers });
+      });
+    });
+    r.on('error', reject);
+    if (payload) r.write(payload);
+    r.end();
+  });
+}
+
+// 以 multipart 上传 ZIP 方案包（字段名 package）。
+function packageMultipart(zipBuf, fields = {}, filename = 'pkg.zip') {
+  const boundary = '----smokepkg' + Math.random().toString(16).slice(2);
+  const crlf = '\r\n';
+  let head = '';
+  for (const [k, v] of Object.entries(fields)) {
+    head += `--${boundary}${crlf}Content-Disposition: form-data; name="${k}"${crlf}${crlf}${v}${crlf}`;
+  }
+  head += `--${boundary}${crlf}Content-Disposition: form-data; name="package"; filename="${filename}"${crlf}Content-Type: application/zip${crlf}${crlf}`;
+  const tail = `${crlf}--${boundary}--${crlf}`;
+  const payload = Buffer.concat([Buffer.from(head), zipBuf, Buffer.from(tail)]);
+  return {
+    getHeaders() {
+      return { 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': payload.length };
+    },
+    payload,
+  };
+}
+
+async function importZip(zipBuf, fields) {
+  const form = packageMultipart(zipBuf, fields);
+  return reqBuf('POST', '/api/imports', { raw: form.payload, body: form });
+}
+
+// 打开导出包并改写后重新打包（供制造各类非法包）。
+function rewritePackage(zipBuf, mutate) {
+  const entries = zipLib.unzip(zipBuf);
+  const map = new Map(entries);
+  let manifest = JSON.parse(map.get('manifest.json').toString('utf8'));
+  manifest = mutate(manifest, map) || manifest;
+  map.set('manifest.json', Buffer.from(JSON.stringify(manifest, null, 2)));
+  return zipLib.zipEntries([...map.entries()].map(([name, data]) => ({ name, data })));
+}
+
+// 按 ord 对布局做规范化（去掉导入/导出两侧本地 id 差异），便于比较等价性。
+// sherdIdToOrd：陶片本地 id → ord；seamIdToOrd：接缝本地 id → 接缝采纳序。
+function canonicalLayout(layoutObj, sherdIdToOrd, seamIdToOrd) {
+  const groups = layoutObj.groups.map((g) => ({
+    members: g.member_ids.map((id) => sherdIdToOrd.get(id)).sort((a, b) => a - b),
+    rootOrd: sherdIdToOrd.get(g.root_sherd_id),
+    treeSeams: g.tree_seam_ids.map((id) => seamIdToOrd.get(id)).sort((a, b) => a - b),
+    poses: Object.fromEntries(Object.entries(g.poses).map(([id, p]) => [sherdIdToOrd.get(parseInt(id, 10)), p])),
+  })).sort((a, b) => a.rootOrd - b.rootOrd);
+  const unconnected = layoutObj.unconnected.map((id) => sherdIdToOrd.get(id)).sort((a, b) => a - b);
+  return { groups, unconnected };
 }
 
 async function main() {
@@ -581,6 +660,331 @@ async function main() {
   });
   assert(rr.status === 200 && rr.json.project.version === b2ver + 1, '桥接批确认成功，版本只 +1');
   assert(rr.json.seams.length === 4, '桥接批两条候选均已采纳');
+
+  // ===================== 方案移交包（导出 ZIP / 导入 ZIP） =====================
+  // 独立建一个含“连通组成环 + 未连通陶片 + 未标比例尺陶片”的方案作为导出源。
+  r = await req('POST', '/api/projects', { body: { name: '移交方案', tolerance_mm: 2 } });
+  assert(r.status === 201, '创建移交方案');
+  const xpid = r.json.project.id;
+  let xver = r.json.project.version;
+  const x = [];
+  for (let i = 0; i < 5; i++) {
+    const form = multipart({ label: `X${i}`, img_w: '100', img_h: '100' }, png);
+    const rr2 = await req('POST', `/api/projects/${xpid}/sherds`, { version: xver, raw: form.payload, body: form });
+    if (rr2.status !== 201) throw new Error('移交方案上传失败: ' + JSON.stringify(rr2.json));
+    xver = rr2.json.project.version;
+    x.push(rr2.json.sherds[rr2.json.sherds.length - 1].id);
+  }
+  // X0..X3 标比例尺；X4 故意不标（导出/导入后仍为未连通、未标定陶片）。
+  for (let i = 0; i < 4; i++) {
+    const rr2 = await req('PATCH', `/api/sherds/${x[i]}/scale`, { version: xver, body: { scale_px: 100, scale_mm: 10 } });
+    xver = rr2.json.project.version;
+  }
+  async function addXSeam(pair, tx, note) {
+    const rr2 = await req('POST', `/api/projects/${xpid}/seams`,
+      { version: xver, body: { from_id: pair[0], to_id: pair[1], theta_deg: 0, tx, ty: 0, join_note: note || '' } });
+    if (rr2.status !== 201) throw new Error('移交方案建接缝失败: ' + JSON.stringify(rr2.json));
+    xver = rr2.json.project.version;
+    return rr2.json;
+  }
+  await addXSeam([x[0], x[1]], -10, 'x0-1');
+  await addXSeam([x[1], x[2]], -10, 'x1-2');
+  const closed3 = await addXSeam([x[0], x[2]], -20, '闭合 x0-2');
+  await addXSeam([x[2], x[3]], -10, 'x2-3');
+  // 再补一个成环 1->3（链上 -20，闭合边也 -20 => 残差 0）
+  const closed4 = await addXSeam([x[1], x[3]], -20, '闭合 x1-3');
+  const srcState = await req('GET', `/api/projects/${xpid}`);
+  assert(srcState.json.layout.groups.length === 1 && srcState.json.layout.unconnected.length === 1,
+    '导出前：一个四片连通组（含两个闭合环）+ 一片未连通');
+
+  // 1) 导出：ZIP 可下载、可由本模块解析，内容与库中版本快照一致
+  let dl = await reqBuf('GET', `/api/projects/${xpid}/export`);
+  assert(dl.status === 200 && dl.headers['content-type'].includes('zip'), '导出返回 application/zip');
+  assert(/attachment/.test(dl.headers['content-disposition'] || ''), '导出带 attachment 文件名');
+  assert(zipLib.unzip(dl.buf).has('manifest.json'), 'ZIP 内含 manifest.json');
+  let parsed = pkgIO.parseImportPackage(dl.buf);
+  assert(parsed.manifest.project.name === '移交方案'
+    && parsed.manifest.project.tolerance_mm === 2
+    && parsed.manifest.project.source_version === xver, '清单含方案名称、毫米容差与源版本');
+  assert(JSON.stringify(parsed.manifest.checklist) === JSON.stringify(['manifest', 'project', 'sherds', 'seams']),
+    '清单 checklist 完整');
+  assert(parsed.sherds.map((s) => s.ord).join(',') === '1,2,3,4,5', '陶片按序重编号 1..5');
+  assert(parsed.sherds[4].scale_px === null && parsed.sherds[4].scale_mm === null,
+    '未标定陶片比例尺字段为 null 且保留');
+  assert(parsed.seams.length === 5, '接缝按采纳顺序排列（5 条）');
+  assert(parsed.seams.map((s) => s.ord).join(',') === '1,2,3,4,5', '接缝 ord 为 1..5');
+  assert(parsed.seams[0].from_ord === 1 && parsed.seams[0].to_ord === 2
+    && parsed.seams[0].join_note === 'x0-1', '接缝端点用 ord 关联、参数/说明保留');
+  assert(parsed.files.size === 5, '包内照片齐全（5 张）');
+  for (const sh of parsed.sherds) {
+    assert(pkgIO.sha256(parsed.files.get(sh.photo)) === sh.sha256,
+      `照片 ${sh.photo} 摘要与字节一致`);
+  }
+  // 闭合环摘要：恰有 2 个环（接缝 ord 3、5），残差 0、在容差内
+  const rings = parsed.manifest.cycle_check.rings;
+  assert(rings.length === 2 && rings.map((g) => g.seam_ord).join(',') === '3,5',
+    `导出闭合环摘要包含 2 个环且按采纳序（实际 ${rings.map((g) => g.seam_ord).join(',')}）`);
+  assert(rings.every((g) => g.distance_mm === 0 && g.within_tolerance), '闭合环残差均为 0、在容差内');
+  assert(parsed.manifest.cycle_check.tolerance_mm === 2, '闭合环摘要容差等于方案容差');
+
+  // 2) 导出快照一致性：导出期间他人推进版本，包内仍来自同一个旧版本快照
+  const dlConcurrent = await reqBuf('GET', `/api/projects/${xpid}/export`);
+  // 模拟“导出期间被编辑”：直接再导出一次与改名前后比对——本实现读取在单事务内完成，
+  // 这里验证改名后的导出携带新版本号、而此前下载包仍是旧版本号。
+  const pkgBefore = pkgIO.parseImportPackage(dlConcurrent.buf);
+  assert(pkgBefore.manifest.project.source_version === xver, '导出包携带导出时的版本号');
+  let renamed = await req('PATCH', `/api/projects/${xpid}`, { version: xver, body: { name: '移交方案-改名' } });
+  assert(renamed.status === 200, '模拟他人在导出后编辑方案');
+  xver = renamed.json.project.version;
+  const dlAfter = await reqBuf('GET', `/api/projects/${xpid}/export`);
+  assert(pkgIO.parseImportPackage(dlAfter.buf).manifest.project.source_version === xver
+    && pkgIO.parseImportPackage(dlAfter.buf).manifest.project.name === '移交方案-改名',
+    '新导出包反映新版本；旧包仍为旧版本快照（导出不受期间编辑影响）');
+  // 旧包内容不受影响（仍是旧名称）
+  assert(pkgBefore.manifest.project.name === '移交方案', '旧下载包仍来自同一版本快照');
+  // 改回名称，避免后续展示差异
+  renamed = await req('PATCH', `/api/projects/${xpid}`, { version: xver, body: { name: '移交方案' } });
+  xver = renamed.json.project.version;
+
+  // 3) 导入合法包：创建独立方案、重分配本地 ID、布局与闭合环等价
+  const goodZip = (await reqBuf('GET', `/api/projects/${xpid}/export`)).buf;
+  let ir = await importZip(goodZip);
+  assert(ir.status === 201 && ir.json.imported === true, '导入合法包成功（201 独立方案）');
+  const ipid = ir.json.project.id;
+  assert(ipid !== xpid, '导入创建的是新方案（ID 与源方案不同）');
+  assert(ir.json.project.version === 1, '新方案从 v1 开始（不继承源版本号）');
+  assert(ir.json.project.name === '移交方案' && ir.json.project.tolerance_mm === 2,
+    '名称与毫米容差沿用包内值');
+  assert(ir.json.sherds.length === 5 && ir.json.seams.length === 5, '陶片 5、接缝 5 全部导入');
+  assert(ir.json.source.source_version === xver, '响应给出源版本信息');
+  const impState = ir.json;
+  // 新本地 id 与源 id 不必相同；接缝按采纳序连续取得新 id。
+  const seamIds = impState.seams.map((s) => s.id);
+  assert(seamIds.slice().sort((a, b) => a - b).join(',') === seamIds.join(',')
+    && seamIds[4] === seamIds[0] + 4, '接缝新本地 id 连续、采纳顺序保持');
+  // 接缝端点都指向本方案内的陶片（外键正确关联）。
+  const impSherdIds = new Set(impState.sherds.map((s) => s.id));
+  assert(impState.seams.every((s) => impSherdIds.has(s.from_id) && impSherdIds.has(s.to_id)),
+    '接缝与照片（陶片）正确关联到重分配后的本地 ID');
+  // 比例尺与“未标比例尺陶片”等价
+  assert(impState.sherds.filter((s) => s.scale_px).length === 4, '4 片带比例尺、1 片未标定');
+  // 布局等价：连通组成员、根、位姿、未连通陶片在 ord 规范化后完全一致
+  const srcIdToOrd = new Map(srcState.json.sherds.map((s, i) => [s.id, i + 1]));
+  // 导入侧陶片按新 id 升序；导出 ord 亦按源 id 升序赋 1..n，因此第 i 个即 ord i+1。
+  const impIdToOrd = new Map(impState.sherds.map((s, i) => [s.id, i + 1]));
+  // 接缝按 id 升序即采纳顺序，两侧第 i 条接缝的采纳序同为 i+1。
+  const srcSeamToOrd = new Map(srcState.json.seams.map((s, i) => [s.id, i + 1]));
+  const impSeamToOrd = new Map(impState.seams.map((s, i) => [s.id, i + 1]));
+  const srcCanon = canonicalLayout(srcState.json.layout, srcIdToOrd, srcSeamToOrd);
+  const impCanon = canonicalLayout(impState.layout, impIdToOrd, impSeamToOrd);
+  assert(JSON.stringify(srcCanon) === JSON.stringify(impCanon),
+    '导入后连通组、根、陶片世界位姿与未连通集合与源方案等价');
+  // 闭合环结果等价：环残差集合（distance/rotation/within）相同
+  const ringKey = (res) => `${res.distance_mm}/${res.rotation_deg}/${res.within_tolerance}`;
+  const srcRingsFlat = srcState.json.layout.residuals.map(ringKey).sort();
+  const impRingsFlat = impState.layout.residuals.map(ringKey).sort();
+  assert(JSON.stringify(srcRingsFlat) === JSON.stringify(impRingsFlat),
+    '导入后全部闭合环残差与源方案等价');
+  // 照片字节等价：通过新方案的图片接口取回的内容哈希与包内一致
+  for (let i = 0; i < impState.sherds.length; i++) {
+    const imgResp = await reqBuf('GET', impState.sherds[i].image_url);
+    assert(imgResp.status === 200 && pkgIO.sha256(imgResp.buf) === parsed.sherds[i].sha256,
+      `导入陶片 ${i + 1} 照片字节与包内摘要一致`);
+  }
+  // 源方案不受导入影响
+  const srcAgain = await req('GET', `/api/projects/${xpid}`);
+  assert(srcAgain.json.project.id === xpid && srcAgain.json.seams.length === 5, '导入不修改源方案');
+
+  // 再次导入同一包：得到又一个独立方案（ID 再次不同），证明“创建独立方案”而非合并
+  const ir2 = await importZip(goodZip);
+  assert(ir2.status === 201 && ir2.json.project.id !== ipid && ir2.json.project.id !== xpid,
+    '重复导入创建又一个独立方案');
+  // 可选 name 覆盖
+  const ir3 = await importZip(goodZip, { name: '现场复核副本' });
+  assert(ir3.status === 201 && ir3.json.project.name === '现场复核副本', '导入支持 name 覆盖新方案名');
+
+  // 4) 损坏 / 非 ZIP 包 => 400 package_invalid(zip_unreadable)
+  ir = await importZip(Buffer.from('this is definitely not a zip package'));
+  assert(ir.status === 400 && ir.json.error.reason === 'package_invalid', '非 ZIP 包整包拒绝 400');
+  assert(ir.json.error.issues[0].code === 'zip_unreadable', '400 指出 ZIP 无法解压');
+
+  // 5) 清单类问题（逐项制造，均须 400 且带 issues）
+  const expectInvalid = async (mutate, code, msg) => {
+    const bad = rewritePackage(goodZip, mutate);
+    const rr3 = await importZip(bad);
+    assert(rr3.status === 400 && rr3.json.error.reason === 'package_invalid',
+      `${msg}：整包拒绝 400`);
+    assert(rr3.json.error.issues.some((it) => it.code === code),
+      `${msg}：issues 含 ${code}（实际 ${rr3.json.error.issues.map((it) => it.code).join(',')}）`);
+  };
+  await expectInvalid((m) => { m.kind = 'something-else'; }, 'kind_unknown', 'kind 不被识别');
+  await expectInvalid((m) => { m.format_version = 99; }, 'format_version_unsupported', '格式版本不受支持');
+  await expectInvalid((m) => { m.checklist = ['manifest']; }, 'checklist_mismatch', 'checklist 不符');
+  await expectInvalid((m) => { m.project.tolerance_mm = -1; }, 'tolerance_invalid', '容差非法');
+  await expectInvalid((m) => { m.project.name = ''; }, 'project_name_invalid', '方案名为空');
+  await expectInvalid((m) => { m.sherds[0].scale_mm = null; }, 'sherd_scale_invalid', '比例尺只给一半');
+  await expectInvalid((m) => { m.sherds[0].img_w = 0; }, 'sherd_dimension_invalid', '图像尺寸越界');
+  await expectInvalid((m) => { m.seams[0].theta_deg = 999; }, 'seam_param_invalid', '接缝角度越界');
+  await expectInvalid((m) => { m.seams[0].to_ord = m.seams[0].from_ord; }, 'seam_same_endpoint', '接缝连同一片');
+  await expectInvalid((m) => { m.seams[0].to_ord = 99; }, 'seam_endpoint_missing', '接缝端点不存在');
+  await expectInvalid((m) => { m.seams[0].from_ord = 5; }, 'seam_endpoint_unscaled', '接缝端点未标比例尺');
+  await expectInvalid((m) => { m.cycle_check.tolerance_mm = 99; }, 'cycle_check_tolerance_mismatch', '闭合环摘要容差不一致');
+
+  // 6) 缺失文件：清单声明照片但包内无该条目
+  {
+    const entries = zipLib.unzip(goodZip);
+    const map = new Map(entries);
+    map.delete('photos/sherd-2.png');
+    const bad = zipLib.zipEntries([...map.entries()].map(([name, data]) => ({ name, data })));
+    const rr3 = await importZip(bad);
+    assert(rr3.status === 400 && rr3.json.error.issues.some((it) => it.code === 'photo_missing'),
+      '缺失照片文件 => 400 photo_missing');
+  }
+
+  // 7) 重复文件 / 重复 ord：ZIP 读写器直接拒绝重复条目；清单内重复 ord
+  {
+    const entries = zipLib.unzip(goodZip);
+    const names = [...entries.keys()];
+    const bad = zipLib.zipEntries([
+      ...names.map((name) => ({ name, data: entries.get(name) })),
+      { name: 'photos/sherd-1.png', data: entries.get('photos/sherd-1.png') },
+    ]);
+    const rr3 = await importZip(bad);
+    assert(rr3.status === 400 && rr3.json.error.issues[0].code === 'zip_unreadable',
+      'ZIP 内重复条目 => 400（无法解压）');
+  }
+  await expectInvalid((m) => { m.sherds[1].ord = 1; }, 'sherd_ord_duplicate', '陶片 ord 重复');
+  await expectInvalid((m) => { m.seams[1].ord = 1; }, 'seam_ord_duplicate', '接缝 ord 重复');
+
+  // 8) 越界路径：放入 ../ 条目 => 400 path_outside_package
+  {
+    const entries = zipLib.unzip(goodZip);
+    const bad = zipLib.zipEntries([
+      ...[...entries.entries()].map(([name, data]) => ({ name, data })),
+      { name: '../../../etc/evil', data: Buffer.from('x') },
+    ]);
+    const rr3 = await importZip(bad);
+    assert(rr3.status === 400 && rr3.json.error.issues.some((it) => it.code === 'path_outside_package'),
+      '越界路径（../）=> 400 path_outside_package');
+    const backslash = zipLib.zipEntries([
+      ...[...entries.entries()].map(([name, data]) => ({ name, data })),
+      { name: 'photos\\..\\evil.png', data: Buffer.from('x') },
+    ]);
+    const rr4 = await importZip(backslash);
+    assert(rr4.status === 400 && rr4.json.error.issues.some((it) => it.code === 'path_outside_package'),
+      '反斜杠越界路径 => 400 path_outside_package');
+  }
+
+  // 9) 照片摘要不符 / 非图片伪装
+  await expectInvalid((m) => { m.sherds[0].sha256 = 'a'.repeat(64); }, 'photo_digest_mismatch', '照片哈希被篡改');
+  {
+    const entries = zipLib.unzip(goodZip);
+    const map = new Map(entries);
+    map.set('photos/sherd-1.png', Buffer.from('not-an-image-at-all'));
+    const bad = zipLib.zipEntries([...map.entries()].map(([name, data]) => ({ name, data })));
+    const rr3 = await importZip(bad);
+    const codes = rr3.json.error.issues.map((it) => it.code);
+    assert(rr3.status === 400 && codes.includes('photo_not_image') && codes.includes('photo_digest_mismatch'),
+      '非图片伪装照片 => 400（魔数不符且摘要不符）');
+  }
+
+  // 10) 清单之外的意外文件 => 400 unexpected_file
+  {
+    const entries = zipLib.unzip(goodZip);
+    const bad = zipLib.zipEntries([
+      ...[...entries.entries()].map(([name, data]) => ({ name, data })),
+      { name: 'random/notes.txt', data: Buffer.from('hi') },
+    ]);
+    const rr3 = await importZip(bad);
+    assert(rr3.status === 400 && rr3.json.error.issues.some((it) => it.code === 'unexpected_file'),
+      '清单之外的意外文件 => 400 unexpected_file');
+  }
+
+  // 11) 全部闭合环超容差 => 422 整包拒绝（改接缝使闭合环偏差 4mm > 2mm）
+  {
+    // 接缝 ord1 = X0->X1 tx=-10（树）。改其 tx=-14 => X1=14,X2=24,X3=34：
+    // 闭合环 ord5（X1->X3，闭合边 -20，预测 34）仍 0；
+    // 闭合环 ord3（X0->X2，闭合边 -20 预测 20，树位姿 24）偏差 4mm 超差。
+    const bad = rewritePackage(goodZip, (m) => { m.seams[0].tx = -14; });
+    const rr3 = await importZip(bad);
+    assert(rr3.status === 422 && rr3.json.error.reason === 'import_cycle_tolerance_exceeded',
+      '闭合环超容差 => 422 整包拒绝');
+    assert(rr3.json.error.violations.length === 1,
+      `恰有闭合环 ord3（X0->X2）超差（实际 ${rr3.json.error.violations.length}）`);
+    const v = rr3.json.error.violations[0];
+    assert(v.seam_ord === 3 && v.from_ord === 1 && v.to_ord === 3 && v.deviation_mm === 4,
+      `422 指向接缝 ord3（X0→X2）、偏差 4mm（实际 seam_ord=${v.seam_ord} ${v.from_ord}->${v.to_ord} dev=${v.deviation_mm}）`);
+    assert(v.conflict_chain.closing_seam.seam_ord === 3
+      && v.conflict_chain.closing_seam.from_ord === 1 && v.conflict_chain.closing_seam.to_ord === 3
+      && v.conflict_chain.sherds.map((s) => s.ord).join(',') === '1,2,3'
+      && v.conflict_chain.seams.map((s) => s.seam_ord).join(',') === '1,2',
+      '冲突链陶片路径 X0→X1→X2，沿生成树接缝 ord1、ord2，闭合接缝 ord3');
+  }
+
+  // 12) 任何拒绝都不留下方案或孤儿照片
+  const projectsBefore = (await req('GET', '/api/projects')).json.projects.length;
+  await importZip(Buffer.from('garbage'));
+  await importZip(rewritePackage(goodZip, (m) => { m.seams[0].tx = -14; }));
+  {
+    const entries = zipLib.unzip(goodZip);
+    const map = new Map(entries);
+    map.delete('photos/sherd-3.png');
+    const bad = zipLib.zipEntries([...map.entries()].map(([name, data]) => ({ name, data })));
+    await importZip(bad);
+  }
+  const projectsAfter = (await req('GET', '/api/projects')).json.projects.length;
+  assert(projectsAfter === projectsBefore, '拒绝导入后方案数量不变（未留下方案）');
+  // uploads 目录中的文件数：合法导入了 3 次（ipid、ir2、ir3），每次 5 张，共 +15 张；
+  // 拒绝的导入一张都不得落盘。
+  const uploadFiles = fs.readdirSync(process.env.UPLOAD_DIR)
+    .filter((f) => fs.statSync(path.join(process.env.UPLOAD_DIR, f)).isFile());
+  // 统计当前所有方案陶片引用的图片文件总数，磁盘文件应恰好等于引用集合（无孤儿）。
+  const allState = await req('GET', '/api/projects');
+  let referenced = 0;
+  for (const pj of allState.json.projects) {
+    const st = await req('GET', `/api/projects/${pj.id}`);
+    referenced += st.json.sherds.length;
+  }
+  assert(uploadFiles.length === referenced,
+    `磁盘照片数（${uploadFiles.length}）等于全部方案陶片引用数（${referenced}）——无孤儿照片`);
+
+  // 13) 空包（无陶片、无接缝）也可导入为独立空方案
+  {
+    const emptyManifest = {
+      kind: 'sherd-stitch-workbench.package', format_version: 1,
+      checklist: ['manifest', 'project', 'sherds', 'seams'],
+      project: { name: '空方案', tolerance_mm: 2, source_version: 1 },
+      sherds: [], seams: [],
+      cycle_check: { tolerance_mm: 2, rings: [] },
+    };
+    const emptyZip = zipLib.zipEntries([
+      { name: 'manifest.json', data: Buffer.from(JSON.stringify(emptyManifest)) },
+    ]);
+    const rr3 = await importZip(emptyZip);
+    assert(rr3.status === 201 && rr3.json.sherds.length === 0 && rr3.json.seams.length === 0,
+      '空方案包导入成功（独立空方案）');
+  }
+
+  // 14) 导出不存在的方案 => 404；缺 package 字段 => 400
+  dl = await reqBuf('GET', '/api/projects/999999/export');
+  assert(dl.status === 404, '导出不存在方案 => 404');
+  {
+    const form = packageMultipart(goodZip, {}, 'pkg.zip');
+    // 手工把字段名 package 改成 other 再发
+    const broken = form.payload.toString('latin1')
+      .replace(/name="package"/g, 'name="other"');
+    const rr3 = await new Promise((resolve) => {
+      const headers = form.getHeaders();
+      const r = http.request({ host: '127.0.0.1', port: process.env.PORT, path: '/api/imports', method: 'POST', headers }, (res) => {
+        let c = '';
+        res.on('data', (d) => (c += d));
+        res.on('end', () => resolve({ status: res.statusCode, json: JSON.parse(c) }));
+      });
+      r.write(Buffer.from(broken, 'latin1'));
+      r.end();
+    });
+    assert(rr3.status === 400, '导入缺少 package 字段 => 400');
+  }
 
   console.log('\n全部冒烟检查通过 ✅');
   process.exit(0);
