@@ -60,4 +60,8 @@ export const api = {
       version,
       body: { candidates, base_version: baseVersion, batch_fingerprint: fingerprint },
     }).then((r) => r.data),
+  // 方案包：导出为只读 GET（浏览器直接下载）；导入为 multipart 上传，返回新方案。
+  exportProjectUrl: (id) => `/api/projects/${id}/export`,
+  importProject: (formData) =>
+    request('POST', '/api/projects/import', { body: formData }).then((r) => ({ data: r.data, status: r.status })),
 };

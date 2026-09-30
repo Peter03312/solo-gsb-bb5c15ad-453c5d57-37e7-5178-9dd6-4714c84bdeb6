@@ -20,6 +20,14 @@ async function renderHome() {
         <button id="np-create">新建方案</button>
       </div>
 
+      <div class="new-project" style="margin-top:10px">
+        <label class="field" style="flex:1">从另一台工作台转交：导入自包含方案包（.zip，含照片、比例尺与接缝）
+          <input type="file" id="imp-file" accept=".zip,application/zip" />
+        </label>
+        <button id="imp-btn">导入方案包</button>
+      </div>
+      <div class="kv" id="imp-hint" style="margin:4px 0 14px"></div>
+
       <table class="list">
         <thead><tr><th>ID</th><th>名称</th><th>容差</th><th>版本</th><th>更新时间</th><th></th></tr></thead>
         <tbody>
@@ -44,6 +52,33 @@ async function renderHome() {
     if (!(tol > 0)) return toast('容差必须是正数（毫米）', 'error');
     const state = await api.createProject(name, tol);
     location.hash = `#/project/${state.project.id}`;
+  };
+
+  const impFile = document.getElementById('imp-file');
+  const impHint = document.getElementById('imp-hint');
+  impFile.onchange = () => {
+    impHint.textContent = impFile.files[0] ? `已选择：${impFile.files[0].name}` : '';
+  };
+  document.getElementById('imp-btn').onclick = async () => {
+    const file = impFile.files[0];
+    if (!file) return toast('请先选择 .zip 方案包', 'warn');
+    const fd = new FormData();
+    fd.append('package', file, file.name);
+    try {
+      const { data } = await api.importProject(fd);
+      toast(`方案包已导入为独立新方案「${data.project.name}」`, 'success');
+      location.hash = `#/project/${data.project.id}`;
+    } catch (e) {
+      // 损坏/不合法的包整包拒绝：展示服务器给出的具体原因。
+      const info = e.data && e.data.error;
+      toast(info ? `导入被拒绝：${info.message}` : e.message, 'error');
+      impHint.innerHTML = '';
+      if (info && info.reason === 'package_cycle_tolerance_exceeded' && info.violations) {
+        impHint.innerHTML = `有 ${info.violations.length} 个闭合环超容差（容差 ${info.tolerance_mm} mm）：` +
+          info.violations.map((v) =>
+            `接缝 #${v.seam_ord}（陶片 #${v.from_ord}→#${v.to_ord}）偏差 ${v.deviation_mm} mm`).join('；');
+      }
+    }
   };
 }
 

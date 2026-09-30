@@ -709,7 +709,12 @@ export async function mountWorkspace(projectId) {
   function renderTopbar() {
     document.getElementById('topbar-right').innerHTML = `
       <span class="ver">方案 v${state.project.version} · 容差 ${state.project.tolerance_mm} mm</span>
+      <button class="secondary" id="btn-export-pkg" style="font-size:13px">⬇ 下载方案包</button>
       <a href="#/" style="color:#f6efe2;font-size:13px">← 方案列表</a>`;
+    document.getElementById('btn-export-pkg').onclick = () => {
+      // 浏览器直接下载；服务器在同一版本快照内打包，下载期间方案被编辑也不影响包内容。
+      window.location.href = api.exportProjectUrl(state.project.id);
+    };
   }
 
   renderAll();

@@ -8,12 +8,15 @@ const multer = require('multer');
 const crypto = require('crypto');
 const { openDb } = require('./src/db');
 const layout = require('./src/layout');
+const pkg = require('./src/package');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DB_FILE = process.env.DB_FILE || path.join(DATA_DIR, 'workbench.db');
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(DATA_DIR, 'uploads');
 const MAX_UPLOAD_MB = parseInt(process.env.MAX_UPLOAD_MB || '20', 10);
+// 方案包内含全部照片，上限默认放宽到 200MB（导入时以内存缓冲校验，整包合法后才落库）。
+const MAX_PACKAGE_MB = parseInt(process.env.MAX_PACKAGE_MB || '200', 10);
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
@@ -418,6 +421,193 @@ app.delete('/api/projects/:id', wrap((req, res) => {
   res.status(204).end();
 }));
 
+// ---------- 方案包导出 / 导入（工作台之间转交方案）----------
+//
+// 导出：GET /api/projects/:id/export → 自包含 ZIP（只读，不需要 Base-Version）。
+//   从读项目行到读全部照片字节全部在同一段同步执行内完成（better-sqlite3 与
+//   fs.readFileSync 均为同步），Node 单线程下不会被其他写请求插入，因此包内
+//   名称/容差/陶片/接缝/照片必然来自同一版本快照；该版本写入清单 source.version。
+//
+// 导入：POST /api/projects/import（multipart 字段 package，.zip）。
+//   完整校验通过后才创建独立新方案、重分配本地 id；任何不合法都整包拒绝，
+//   不留下方案记录或孤儿照片。
+
+const packageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_PACKAGE_MB * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const ext = (path.extname(file.originalname) || '').toLowerCase();
+    if (ext !== '.zip') return cb(new HttpError(400, '方案包必须是 .zip 文件'));
+    cb(null, true);
+  },
+});
+
+app.get('/api/projects/:id/export', wrap((req, res) => {
+  const pid = num(req.params.id, 'id');
+  // 同步快照：project / sherds / seams / 照片字节在同一同步区间读取。
+  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(pid);
+  if (!project) throw new HttpError(404, '方案不存在');
+  const sherds = db.prepare('SELECT * FROM sherds WHERE project_id = ? ORDER BY id').all(pid);
+  const seams = db.prepare('SELECT * FROM seams WHERE project_id = ? ORDER BY id').all(pid);
+  if (sherds.length === 0) {
+    throw new HttpError(400, '空方案（没有陶片照片）不能导出方案包，请先上传陶片', { reason: 'export_empty_project' });
+  }
+  const files = new Map();
+  for (const sh of sherds) {
+    if (files.has(sh.image_file)) continue;
+    const file = path.join(UPLOAD_DIR, path.basename(sh.image_file));
+    if (!fs.existsSync(file)) throw new HttpError(409, `陶片 #${sh.id} 的照片文件在服务器上缺失，无法导出`, {
+      reason: 'export_photo_missing',
+      sherd_id: sh.id,
+    });
+    files.set(sh.image_file, fs.readFileSync(file));
+  }
+
+  let zip;
+  try {
+    zip = pkg.buildPackageZip({ project, sherds, seams, files });
+  } catch (e) {
+    if (e instanceof pkg.PackageError) throw new HttpError(500, `导出失败：${e.message}`);
+    throw e;
+  }
+
+  const safeName = project.name.replace(/[^\w一-龥.-]+/g, '_').slice(0, 80) || 'project';
+  const filename = `sherd-project_${pid}_v${project.version}.zip`;
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition',
+    `attachment; filename="${filename}"; filename*=UTF-8''${encodeURIComponent(`${safeName}_v${project.version}.zip`)}`);
+  res.setHeader('X-Package-Source-Version', String(project.version));
+  res.send(zip);
+}));
+
+// 导入必须放在 /api/projects/:id 系列之外（import 是保留段名，且使用独立路径）。
+app.post('/api/projects/import', (req, res, next) => {
+  packageUpload.single('package')(req, res, (err) => {
+    if (err) return next(err);
+    handlePackageImport(req, res, next);
+  });
+});
+
+const handlePackageImport = wrap(async (req, res) => {
+  if (!req.file) throw new HttpError(400, '缺少方案包文件（multipart 字段名 package）');
+
+  // 1) 全量校验在内存中完成：ZIP 结构、清单、参数、照片摘要、缺失/重复文件、
+  //    越界路径、图像魔数，以及全部闭合环与布局指纹。此阶段不写库、不落盘。
+  let plan;
+  try {
+    plan = pkg.readAndValidatePackage(req.file.buffer, { maxPhotoBytes: MAX_UPLOAD_MB * 1024 * 1024 });
+    pkg.assertCyclesAndChecksum(plan);
+  } catch (e) {
+    if (e instanceof pkg.PackageError) {
+      // 几何超差属“内容语义不合法”，用 422 与既有成环拒绝约定保持一致；
+      // 其余清单/摘要/文件问题一律 400 整包拒绝。
+      const status = e.reason === 'package_cycle_tolerance_exceeded' ? 422 : 400;
+      throw new HttpError(status, e.message, { reason: e.reason, ...(e.extra || {}) });
+    }
+    throw e;
+  }
+
+  // 2) 单事务创建独立方案、陶片与接缝（本地 id 由 SQLite 重新分配）。
+  //    事务成功后再写照片文件；任何一步失败都删除已建方案与已写文件，
+  //    绝不留下半成品方案或孤儿照片。
+  let newPid;
+  const sherdIdMap = new Map(); // 包内 ord → 新本地 sherd id
+  const seamIdMap = new Map(); // 包内接缝 ord → 新本地 seam id
+  const writtenFiles = [];
+  try {
+    const txn = db.transaction(() => {
+      const info = db
+        .prepare('INSERT INTO projects(name, tolerance_mm) VALUES (?, ?)')
+        .run(plan.manifest.project.name, plan.tolerance);
+      const pid = info.lastInsertRowid;
+
+      const insertSherd = db.prepare(
+        'INSERT INTO sherds(project_id, label, image_file, img_w, img_h, scale_px, scale_mm, note) ' +
+        'VALUES (?,?,?,?,?,?,?,?)'
+      );
+      for (const sh of plan.planSherds) {
+        const r = insertSherd.run(
+          pid, sh.label, '', sh.img_w, sh.img_h,
+          sh.scale_px, sh.scale_mm, sh.note
+        );
+        sherdIdMap.set(sh.ord, r.lastInsertRowid);
+        // 与既有上传相同的落盘命名风格：按新本地 id 独立命名，
+        // 不同陶片即使照片字节完全相同也互不影响（绝不共享/覆盖文件）。
+        sh.image.stored_filename =
+          `sherd_imp_${r.lastInsertRowid}_${Math.round(Math.random() * 1e9)}${sh.image.ext}`;
+        db.prepare('UPDATE sherds SET image_file = ? WHERE id = ?')
+          .run(sh.image.stored_filename, r.lastInsertRowid);
+      }
+
+      const insertSeam = db.prepare(
+        'INSERT INTO seams(project_id, from_id, to_id, theta_deg, tx, ty, join_note) VALUES (?,?,?,?,?,?,?)'
+      );
+      // 接缝按包内采纳顺序（ord 升序）逐条插入，自增 id 延续同一采纳序。
+      for (const sm of plan.planSeams) {
+        const sr = insertSeam.run(
+          pid,
+          sherdIdMap.get(sm.from_ord),
+          sherdIdMap.get(sm.to_ord),
+          sm.theta_deg, sm.tx, sm.ty, sm.join_note
+        );
+        seamIdMap.set(sm.ord, sr.lastInsertRowid);
+      }
+      return pid;
+    });
+    newPid = txn();
+
+    // 3) 写照片文件（文件名含新本地 id 与随机后缀，绝不覆盖既有文件）。
+    for (const sh of plan.planSherds) {
+      const filename = sh.image.stored_filename;
+      const dest = path.join(UPLOAD_DIR, filename);
+      fs.writeFileSync(dest, sh.image.buf, { flag: 'wx' });
+      writtenFiles.push(filename);
+    }
+
+    // 4) 从库中重新读取并现算布局：必须与源方案布局指纹一致（id 重映射后比较）。
+    const imported = loadState(newPid);
+    const importedDetailed = layout.computeLayoutDetailed(
+      imported.sherds, imported.seams, imported.project.tolerance_mm
+    );
+    // 把新本地 id 映射回包内 ord（陶片、接缝两个 id 空间分别映射），再与清单指纹比对。
+    const reverseMaps = {
+      sherdMap: new Map([...sherdIdMap].map(([ord, newId]) => [newId, ord])),
+      seamMap: new Map([...seamIdMap].map(([ord, newId]) => [newId, ord])),
+    };
+    const actualFp = pkg.layoutFingerprint(
+      importedDetailed,
+      imported.project.tolerance_mm,
+      reverseMaps
+    );
+    if (actualFp !== plan.manifest.checks.layout_fingerprint) {
+      throw new HttpError(400, '导入后重算布局与源方案布局指纹不一致，已整包回滚', {
+        reason: 'layout_mismatch',
+        expected: plan.manifest.checks.layout_fingerprint,
+        actual: actualFp,
+      });
+    }
+
+    return res.status(201).json({
+      ...statePayload(imported),
+      imported: true,
+      source: {
+        project_id: plan.manifest.source ? plan.manifest.source.project_id : null,
+        version: plan.manifest.source ? plan.manifest.source.version : null,
+      },
+    });
+  } catch (e) {
+    // 失败清理：回滚方案（ON DELETE CASCADE 同时清 sherds/seams）并删除已写照片。
+    if (newPid !== undefined) {
+      try { db.prepare('DELETE FROM projects WHERE id = ?').run(newPid); } catch { /* 忽略二次失败 */ }
+    }
+    for (const f of writtenFiles) {
+      try { fs.unlinkSync(path.join(UPLOAD_DIR, path.basename(f))); } catch { /* 忽略 */ }
+    }
+    if (e instanceof HttpError) throw e;
+    throw new HttpError(400, `方案包导入失败：${e.message}`, { reason: 'invalid_package' });
+  }
+});
+
 // ---------- API: 陶片 ----------
 
 app.post('/api/projects/:id/sherds', (req, res, next) => {
@@ -761,7 +951,9 @@ app.use((err, _req, res, _next) => {
     return res.status(err.status).json({ error: { message: err.message, ...err.extra } });
   }
   if (err && err.code === 'LIMIT_FILE_SIZE') {
-    return res.status(400).json({ error: { message: `图片超过 ${MAX_UPLOAD_MB} MB 上限` } });
+    const mb = _req.path && _req.path.includes('/import') ? MAX_PACKAGE_MB : MAX_UPLOAD_MB;
+    const what = _req.path && _req.path.includes('/import') ? '方案包' : '图片';
+    return res.status(400).json({ error: { message: `${what}超过 ${mb} MB 上限` } });
   }
   console.error(err);
   res.status(500).json({ error: { message: '服务器内部错误' } });

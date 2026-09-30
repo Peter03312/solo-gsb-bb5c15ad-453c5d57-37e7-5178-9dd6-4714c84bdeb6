@@ -11,6 +11,8 @@ services:
       PORT: "8080"
       # 单个陶片照片上传大小上限（MB）
       MAX_UPLOAD_MB: "20"
+      # 导入方案包（ZIP，含全部照片）大小上限（MB）
+      MAX_PACKAGE_MB: "200"
       DATA_DIR: "/data"
     volumes:
       # SQLite 数据库与上传图片持久化到命名卷
